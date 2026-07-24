@@ -26,14 +26,72 @@ from typing import Optional
 
 import click
 
-from core.exceptions import DuplicateJobError, JobNotFoundError
+from config import (
+    KNOWN_KEYS,
+    display_key,
+    get_all_config,
+    get_config_value,
+    normalize_key,
+    set_config_value,
+)
+from core.exceptions import (
+    DuplicateJobError,
+    InvalidStateTransitionError,
+    JobNotFoundError,
+)
 from core.job import JobState
 from core.job_service import (
     enqueue as svc_enqueue,
     get_job_counts,
     list_jobs as svc_list_jobs,
 )
+from core.retry import dlq_retry as svc_dlq_retry
 from storage.db import get_connection, initialize_schema
+
+# ---------------------------------------------------------------------------
+# Config key validation helpers
+# ---------------------------------------------------------------------------
+
+# CLI-style keys accepted by `config set` and `config get`.
+_VALID_CLI_KEYS: frozenset[str] = frozenset(
+    {"max-retries", "backoff-base", "timeout-seconds", "poll-interval-ms"}
+)
+
+# Per-key type constraints used when validating `config set` values.
+_KEY_CONSTRAINTS: dict[str, dict] = {
+    "max_retries":     {"type": int,   "min": 0},
+    "backoff_base":    {"type": float, "min": 1.0},
+    "timeout_seconds": {"type": int,   "min": 1},
+    "poll_interval_ms":{"type": int,   "min": 100},
+}
+
+
+def _validate_config_value(db_key: str, raw: str) -> str:
+    """
+    Validate *raw* against the type and minimum constraint for *db_key*.
+
+    Returns *raw* unchanged if valid.
+    Raises :class:`click.ClickException` with a descriptive message if not.
+    """
+    constraint = _KEY_CONSTRAINTS.get(db_key)
+    if constraint is None:
+        return raw   # unknown key — no validation
+
+    expected_type = constraint["type"]
+    min_val = constraint["min"]
+    try:
+        parsed = expected_type(raw)
+    except ValueError:
+        raise click.ClickException(
+            f"Invalid value for '{display_key(db_key)}': "
+            f"expected {expected_type.__name__}, got {raw!r}."
+        )
+    if parsed < min_val:
+        raise click.ClickException(
+            f"Invalid value for '{display_key(db_key)}': "
+            f"must be >= {min_val}, got {parsed}."
+        )
+    return raw
 
 # ---------------------------------------------------------------------------
 # Logging configuration
@@ -250,11 +308,22 @@ def dlq_list() -> None:
 def dlq_retry(job_id: str) -> None:
     """Re-enqueue a dead job for another attempt.
 
-    JOB_ID is reset to pending with attempts=0.
+    JOB_ID is reset to pending with attempts=0 — a fresh retry cycle
+    after operator investigation.
     """
-    # Implemented in Phase 3 (retry)
-    click.echo("dlq retry: not yet implemented", err=True)
-    sys.exit(1)
+    conn = get_connection()
+    initialize_schema(conn)
+    try:
+        job = svc_dlq_retry(conn, job_id)
+        click.echo(
+            f"Job '{job.id}' re-queued  state={job.state}  attempts={job.attempts}"
+        )
+    except JobNotFoundError as exc:
+        raise click.ClickException(str(exc))
+    except InvalidStateTransitionError as exc:
+        raise click.ClickException(str(exc))
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -272,24 +341,61 @@ def config_group() -> None:
 def config_set(key: str, value: str) -> None:
     """Set a configuration value.
 
-    Supported keys: max-retries, backoff-base, timeout-seconds, poll-interval-ms
+    Supported keys and their constraints:
+
+    \b
+      max-retries       integer >= 0   (default 3)
+      backoff-base      number  >= 1.0 (default 2)
+      timeout-seconds   integer >= 1   (default 300)
+      poll-interval-ms  integer >= 100 (default 500)
 
     Example:
 
         queuectl config set max-retries 5
     """
-    # Implemented in Phase 3 (config)
-    click.echo("config set: not yet implemented", err=True)
-    sys.exit(1)
+    if key not in _VALID_CLI_KEYS:
+        valid = ", ".join(sorted(_VALID_CLI_KEYS))
+        raise click.ClickException(
+            f"Unknown config key: '{key}'.  Valid keys: {valid}"
+        )
+    db_key = normalize_key(key)
+    _validate_config_value(db_key, value)  # raises ClickException on invalid
+
+    conn = get_connection()
+    initialize_schema(conn)
+    try:
+        set_config_value(conn, db_key, value)
+        click.echo(f"  {key} = {value}")
+    finally:
+        conn.close()
 
 
 @config_group.command("get")
 @click.argument("key", metavar="KEY")
 def config_get(key: str) -> None:
-    """Get the current value of a configuration key."""
-    # Implemented in Phase 3 (config)
-    click.echo("config get: not yet implemented", err=True)
-    sys.exit(1)
+    """Show the current value of a configuration key.
+
+    Supported keys: max-retries, backoff-base, timeout-seconds, poll-interval-ms
+
+    Example:
+
+        queuectl config get max-retries
+    """
+    if key not in _VALID_CLI_KEYS:
+        valid = ", ".join(sorted(_VALID_CLI_KEYS))
+        raise click.ClickException(
+            f"Unknown config key: '{key}'.  Valid keys: {valid}"
+        )
+    db_key = normalize_key(key)
+
+    conn = get_connection()
+    initialize_schema(conn)
+    value = get_config_value(conn, db_key)
+    conn.close()
+
+    if value is None:
+        raise click.ClickException(f"Config key '{key}' has no value set.")
+    click.echo(f"  {key} = {value}")
 
 
 # ---------------------------------------------------------------------------

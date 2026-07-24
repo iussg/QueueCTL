@@ -156,6 +156,21 @@ UPDATE_JOB_RETRY: str = """
     WHERE id = ?
 """
 
+# Operator-initiated DLQ retry — resets a dead job to a fresh pending state.
+# AND state='dead' guard prevents accidentally resetting a non-dead job.
+# attempts=0 represents a fresh retry cycle after operator investigation.
+# params: (updated_at, job_id)
+DLQ_RETRY_JOB: str = """
+    UPDATE jobs
+    SET
+        state       = 'pending',
+        attempts    = 0,
+        next_run_at = NULL,
+        updated_at  = ?
+    WHERE id = ? AND state = 'dead'
+    RETURNING *
+"""
+
 # params: (key,)
 SELECT_CONFIG_VALUE: str = "SELECT value FROM config WHERE key = ?"
 
