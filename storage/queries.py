@@ -59,16 +59,138 @@ SEED_DEFAULT_CONFIG: list[str] = [
 ]
 
 # ---------------------------------------------------------------------------
-# DML — populated in later phases; declared here to keep the module complete.
+# DML — Job lifecycle queries
 # ---------------------------------------------------------------------------
 
-# Phase 2: job_service.py will use:
-#   INSERT_JOB, SELECT_JOB_BY_ID, CLAIM_JOB, UPDATE_JOB_COMPLETE,
-#   UPDATE_JOB_FAILED, UPDATE_JOB_DEAD, SELECT_JOBS_BY_STATE,
-#   SELECT_ALL_JOBS, SELECT_PROCESSING_JOBS (crash recovery)
+# params: (id, command, max_retries, created_at, updated_at)
+INSERT_JOB: str = """
+    INSERT INTO jobs (id, command, state, attempts, max_retries, created_at, updated_at)
+    VALUES (?, ?, 'pending', 0, ?, ?, ?)
+"""
 
-# Phase 3: config.py will use:
-#   SELECT_CONFIG_VALUE, UPSERT_CONFIG_VALUE, SELECT_ALL_CONFIG
+# params: (job_id,)
+SELECT_JOB_BY_ID: str = "SELECT * FROM jobs WHERE id = ?"
 
-# Phase 4: worker.py will use:
-#   RESET_ORPHANED_JOBS (crash recovery on startup)
+# params: ()
+SELECT_ALL_JOBS: str = "SELECT * FROM jobs ORDER BY created_at ASC"
+
+# params: (state,)
+SELECT_JOBS_BY_STATE: str = """
+    SELECT * FROM jobs WHERE state = ? ORDER BY created_at ASC
+"""
+
+# params: ()
+SELECT_JOB_COUNTS: str = """
+    SELECT state, COUNT(*) AS count FROM jobs GROUP BY state
+"""
+
+# The atomic claim query — core concurrency guarantee.
+# SQLite serializes writes, so two workers issuing this UPDATE concurrently
+# will NOT both match the same row.  The second one's subquery simply won't
+# find that row anymore once the first commit lands.
+# params: (worker_id, picked_at, updated_at, now_for_comparison)
+CLAIM_JOB: str = """
+    UPDATE jobs
+    SET
+        state      = 'processing',
+        worker_id  = ?,
+        picked_at  = ?,
+        updated_at = ?
+    WHERE id = (
+        SELECT id FROM jobs
+        WHERE state = 'pending'
+          AND (next_run_at IS NULL OR next_run_at <= ?)
+        ORDER BY created_at ASC
+        LIMIT 1
+    )
+    RETURNING *
+"""
+
+# params: (exit_code, stdout, stderr, finished_at, updated_at, job_id)
+UPDATE_JOB_COMPLETE: str = """
+    UPDATE jobs
+    SET
+        state       = 'completed',
+        exit_code   = ?,
+        stdout      = ?,
+        stderr      = ?,
+        finished_at = ?,
+        updated_at  = ?
+    WHERE id = ?
+"""
+
+# params: (exit_code, stdout, stderr, finished_at, updated_at, job_id)
+# RETURNING * so callers can inspect the updated attempts count immediately.
+UPDATE_JOB_FAILED: str = """
+    UPDATE jobs
+    SET
+        state       = 'failed',
+        attempts    = attempts + 1,
+        exit_code   = ?,
+        stdout      = ?,
+        stderr      = ?,
+        finished_at = ?,
+        updated_at  = ?
+    WHERE id = ?
+    RETURNING *
+"""
+
+# ---------------------------------------------------------------------------
+# DML — Phase 3 (retry + DLQ + config)
+# ---------------------------------------------------------------------------
+
+# params: (updated_at, job_id)
+UPDATE_JOB_DEAD: str = """
+    UPDATE jobs
+    SET state = 'dead', updated_at = ?
+    WHERE id = ?
+"""
+
+# params: (next_run_at, updated_at, job_id)
+UPDATE_JOB_RETRY: str = """
+    UPDATE jobs
+    SET
+        state       = 'pending',
+        next_run_at = ?,
+        updated_at  = ?
+    WHERE id = ?
+"""
+
+# params: (key,)
+SELECT_CONFIG_VALUE: str = "SELECT value FROM config WHERE key = ?"
+
+# params: (key, value)
+UPSERT_CONFIG_VALUE: str = """
+    INSERT INTO config (key, value) VALUES (?, ?)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+"""
+
+# params: ()
+SELECT_ALL_CONFIG: str = "SELECT key, value FROM config ORDER BY key ASC"
+
+# ---------------------------------------------------------------------------
+# DML — Phase 4 (worker / crash recovery)
+# ---------------------------------------------------------------------------
+
+# Identifies jobs orphaned by a crashed worker (startup recovery scan).
+# params: ()
+SELECT_PROCESSING_JOBS: str = "SELECT * FROM jobs WHERE state = 'processing'"
+
+# Resets orphaned processing jobs to pending so they can be reclaimed.
+# params: (updated_at,)
+RESET_ORPHANED_JOBS: str = """
+    UPDATE jobs
+    SET
+        state     = 'pending',
+        worker_id = NULL,
+        updated_at = ?
+    WHERE state = 'processing'
+"""
+
+# Records the exact moment subprocess execution begins (distinct from picked_at).
+# params: (started_at, updated_at, job_id)
+UPDATE_JOB_STARTED: str = """
+    UPDATE jobs
+    SET started_at = ?, updated_at = ?
+    WHERE id = ?
+"""
