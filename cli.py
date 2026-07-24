@@ -187,18 +187,70 @@ def worker_group() -> None:
     help="Number of worker processes to spawn.",
 )
 def worker_start(count: int) -> None:
-    """Start N worker processes."""
-    # Implemented in Phase 4 (worker)
-    click.echo("worker start: not yet implemented", err=True)
-    sys.exit(1)
+    """Start N worker processes and block until interrupted.
+
+    Each worker polls the queue independently, claims jobs atomically,
+    and executes them as subprocesses.  Press Ctrl+C to stop all workers
+    after the current job finishes.
+
+    Examples:
+
+        queuectl worker start          # single worker (default)
+        queuectl worker start -n 4     # 4 parallel workers
+    """
+    import multiprocessing
+    import os
+    from core.worker import Worker, _worker_process_main
+
+    if count == 1:
+        # Run directly in the foreground — no subprocess overhead,
+        # output goes straight to the terminal.
+        click.echo(f"Starting 1 worker (pid={os.getpid()})...  Press Ctrl+C to stop.")
+        _worker_process_main(f"worker-{os.getpid()}")
+        return
+
+    # Spawn N worker processes.
+    click.echo(f"Starting {count} workers...  Press Ctrl+C to stop all.")
+    processes: list[multiprocessing.Process] = []
+    for i in range(count):
+        worker_id = f"worker-{os.getpid()}-{i}"
+        p = multiprocessing.Process(
+            target=_worker_process_main,
+            args=(worker_id,),
+            name=worker_id,
+            daemon=False,
+        )
+        p.start()
+        click.echo(f"  Started {worker_id}  (pid={p.pid})")
+        processes.append(p)
+
+    try:
+        for p in processes:
+            p.join()
+    except KeyboardInterrupt:
+        click.echo("\nShutting down workers (waiting for current jobs to finish)...")
+        # Workers have their own SIGINT handlers; just wait for them.
+        for p in processes:
+            p.join(timeout=30)
+        # Force-terminate any that didn't stop cleanly.
+        for p in processes:
+            if p.is_alive():
+                click.echo(f"  Force-terminating {p.name} (pid={p.pid})")
+                p.terminate()
 
 
 @worker_group.command("stop")
 def worker_stop() -> None:
-    """Gracefully stop all running worker processes."""
-    # Implemented in Phase 4 (worker)
-    click.echo("worker stop: not yet implemented", err=True)
-    sys.exit(1)
+    """Gracefully stop all running worker processes.
+
+    Workers respond to Ctrl+C / SIGINT by finishing the current job
+    and then exiting.  This command is a placeholder; in production
+    you would send SIGINT/SIGTERM to the worker PIDs directly.
+    """
+    click.echo(
+        "Send Ctrl+C (SIGINT) to the worker process to stop it after "
+        "the current job finishes."
+    )
 
 
 # ---------------------------------------------------------------------------
