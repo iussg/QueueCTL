@@ -29,3 +29,22 @@ def tmp_db(tmp_path: Path) -> sqlite3.Connection:
     initialize_schema(conn)
     yield conn
     conn.close()
+
+
+@pytest.fixture
+def tmp_db_path(tmp_path: Path) -> Path:
+    """
+    Provide the *file path* to an initialized temporary SQLite database.
+
+    Used by concurrency tests that must pass the DB location to child
+    processes — sqlite3 connections cannot be shared across OS process
+    boundaries, so each worker creates its own connection from this path.
+
+    Yields:
+        A :class:`pathlib.Path` pointing to the initialized DB file.
+    """
+    db_path = tmp_path / "concurrency_test.db"
+    conn = get_connection(db_path)
+    initialize_schema(conn)
+    conn.close()
+    return db_path
