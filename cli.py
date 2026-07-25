@@ -172,17 +172,39 @@ def cli() -> None:
 # ---------------------------------------------------------------------------
 
 @cli.command("enqueue")
-@click.argument("job_json")
-def enqueue(job_json: str) -> None:
+@click.argument("job_json", required=False, default=None)
+def enqueue(job_json: str | None) -> None:
     """Enqueue a new job from a JSON specification.
 
     JOB_JSON must be a JSON object with at least "id" and "command" fields.
     An optional "max_retries" integer field overrides the queue default.
 
-    Example:
+    Pass - as JOB_JSON to read the JSON from stdin (pipe-friendly, avoids
+    shell quoting issues on Windows PowerShell):
 
-        queuectl enqueue '{"id":"job1","command":"sleep 2"}'
+    \b
+    PowerShell / Windows:
+        echo '{\"id\":\"j1\",\"command\":\"echo hi\"}' | python cli.py enqueue -
+
+    \b
+    Bash / macOS / Linux:
+        queuectl enqueue '{"id":"j1","command":"echo hi"}'
+        echo '{"id":"j1","command":"echo hi"}' | queuectl enqueue -
+
+    \b
+    Or use the seed_jobs.py helper for bulk seeding during demos.
     """
+    # --- Resolve JSON source ---
+    if job_json is None or job_json == "-":
+        # Read from stdin — works perfectly in PowerShell via pipe.
+        raw = click.get_text_stream("stdin").read().strip()
+        if not raw:
+            raise click.ClickException(
+                "No JSON received on stdin.  "
+                "Pipe JSON to this command: echo '{...}' | python cli.py enqueue -"
+            )
+        job_json = raw
+
     # --- Parse ---
     try:
         data = json.loads(job_json)
