@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=42"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "queuectl"
+version = "0.1.0"
+description = "CLI-based background job queue backed by SQLite"
+requires-python = ">=3.10"
+dependencies = ["click>=8.1.0"]
+
+[project.scripts]
+queuectl = "cli:cli"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["core*", "storage*"]
