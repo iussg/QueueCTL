@@ -21,7 +21,10 @@ Command surface (per EDD Section 8):
 
 import json
 import logging
+import os
+import signal
 import sys
+from pathlib import Path
 from typing import Optional
 
 import click
@@ -95,16 +98,63 @@ def _validate_config_value(db_key: str, raw: str) -> str:
 
 # ---------------------------------------------------------------------------
 # Logging configuration
-# Format mirrors EDD Section 9: [LEVEL] timestamp source message
+# EDD Section 9 format: [LEVEL] timestamp message
+# Example: [INFO] 2026-07-23T10:15:03Z Worker-2 Job17 attempt=2 claimed
 # ---------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
-    format="[%(levelname)s] %(asctime)sZ %(name)s — %(message)s",
+    format="[%(levelname)s] %(asctime)sZ %(message)s",
     datefmt="%Y-%m-%dT%H:%M:%S",
     stream=sys.stderr,
 )
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# PID file helpers — used by worker start / worker stop
+# ---------------------------------------------------------------------------
+
+def _pid_file_path() -> Path:
+    """
+    Return the path to the worker PID file.
+
+    The file is placed in the same directory as the SQLite DB so that
+    ``worker stop`` can locate it without any extra configuration.
+    """
+    from storage.db import get_db_path
+    return get_db_path().parent / "queuectl_workers.json"
+
+
+def _write_pid_file(pids: list[int]) -> None:
+    """Persist the PIDs of all running workers to disk."""
+    import json
+    pid_file = _pid_file_path()
+    pid_file.parent.mkdir(parents=True, exist_ok=True)
+    pid_file.write_text(
+        json.dumps({"pids": pids, "count": len(pids)}),
+        encoding="utf-8",
+    )
+    logger.info("PID file written: %s (pids=%s)", pid_file, pids)
+
+
+def _remove_pid_file() -> None:
+    """Delete the PID file after all workers have stopped."""
+    pid_file = _pid_file_path()
+    pid_file.unlink(missing_ok=True)
+
+
+def _read_pid_file() -> list[int] | None:
+    """Return the PIDs from the PID file, or None if the file does not exist."""
+    import json
+    pid_file = _pid_file_path()
+    if not pid_file.exists():
+        return None
+    try:
+        data = json.loads(pid_file.read_text(encoding="utf-8"))
+        return data.get("pids", [])
+    except (json.JSONDecodeError, OSError):
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -190,8 +240,14 @@ def worker_start(count: int) -> None:
     """Start N worker processes and block until interrupted.
 
     Each worker polls the queue independently, claims jobs atomically,
-    and executes them as subprocesses.  Press Ctrl+C to stop all workers
-    after the current job finishes.
+    and executes them as subprocesses.
+
+    Worker PIDs are written to a file alongside the database so that
+    ``queuectl worker stop`` (run from a second terminal) can locate
+    and gracefully signal them.
+
+    Press Ctrl+C in this terminal to stop all workers after the current
+    job finishes (same effect as ``worker stop``).
 
     Examples:
 
@@ -200,17 +256,21 @@ def worker_start(count: int) -> None:
     """
     import multiprocessing
     import os
-    from core.worker import Worker, _worker_process_main
+    from core.worker import _worker_process_main
 
     if count == 1:
-        # Run directly in the foreground — no subprocess overhead,
-        # output goes straight to the terminal.
-        click.echo(f"Starting 1 worker (pid={os.getpid()})...  Press Ctrl+C to stop.")
-        _worker_process_main(f"worker-{os.getpid()}")
+        pid = os.getpid()
+        worker_id = f"worker-{pid}"
+        click.echo(f"Starting 1 worker (pid={pid})...  Press Ctrl+C or run 'queuectl worker stop' to stop.")
+        _write_pid_file([pid])
+        try:
+            _worker_process_main(worker_id)
+        finally:
+            _remove_pid_file()
         return
 
     # Spawn N worker processes.
-    click.echo(f"Starting {count} workers...  Press Ctrl+C to stop all.")
+    click.echo(f"Starting {count} workers...  Press Ctrl+C or run 'queuectl worker stop' to stop all.")
     processes: list[multiprocessing.Process] = []
     for i in range(count):
         worker_id = f"worker-{os.getpid()}-{i}"
@@ -224,33 +284,124 @@ def worker_start(count: int) -> None:
         click.echo(f"  Started {worker_id}  (pid={p.pid})")
         processes.append(p)
 
+    _write_pid_file([p.pid for p in processes if p.pid is not None])
     try:
         for p in processes:
             p.join()
     except KeyboardInterrupt:
-        click.echo("\nShutting down workers (waiting for current jobs to finish)...")
-        # Workers have their own SIGINT handlers; just wait for them.
+        click.echo("\nCtrl+C received — waiting for current jobs to finish...")
         for p in processes:
             p.join(timeout=30)
-        # Force-terminate any that didn't stop cleanly.
         for p in processes:
             if p.is_alive():
                 click.echo(f"  Force-terminating {p.name} (pid={p.pid})")
                 p.terminate()
+    finally:
+        _remove_pid_file()
 
 
 @worker_group.command("stop")
-def worker_stop() -> None:
-    """Gracefully stop all running worker processes.
+@click.option(
+    "--timeout", "-t",
+    default=30,
+    show_default=True,
+    type=click.IntRange(min=1),
+    help="Seconds to wait for each worker to finish its current job before force-killing.",
+)
+def worker_stop(timeout: int) -> None:
+    """Gracefully stop all workers started by 'worker start'.
 
-    Workers respond to Ctrl+C / SIGINT by finishing the current job
-    and then exiting.  This command is a placeholder; in production
-    you would send SIGINT/SIGTERM to the worker PIDs directly.
+    Reads the PID file written by 'worker start', sends each worker a
+    termination signal, then waits up to TIMEOUT seconds for it to
+    finish its current job and exit cleanly.
+
+    On Unix/macOS: SIGTERM is sent — workers complete the current job
+    before exiting (the signal handler sets a shutdown flag).
+
+    On Windows: TerminateProcess is used (immediate) because Windows
+    does not support inter-process SIGTERM delivery.
+
+    After TIMEOUT seconds any worker that has not yet exited is
+    force-killed with SIGKILL (Unix) or TerminateProcess (Windows).
+
+    Run from a second terminal while 'worker start' is blocking:
+
+        queuectl worker stop
+        queuectl worker stop --timeout 60   # allow up to 60 s
     """
-    click.echo(
-        "Send Ctrl+C (SIGINT) to the worker process to stop it after "
-        "the current job finishes."
-    )
+    import json
+    import time
+
+    pids = _read_pid_file()
+    if pids is None:
+        raise click.ClickException(
+            "No worker PID file found.  Either no workers are running or "
+            "the file was cleaned up already."
+        )
+    if not pids:
+        click.echo("PID file exists but is empty — nothing to stop.")
+        _remove_pid_file()
+        return
+
+    click.echo(f"Stopping {len(pids)} worker(s): {pids}")
+
+    # ── Send graceful shutdown signal ────────────────────────────────────
+    for pid in pids:
+        try:
+            if sys.platform == "win32":
+                # TerminateProcess — immediate on Windows.
+                # Workers will not finish their current job, but the
+                # process does stop.  Orphaned jobs are recovered on
+                # next startup via crash recovery.
+                import ctypes
+                ctypes.windll.kernel32.TerminateProcess(
+                    ctypes.windll.kernel32.OpenProcess(1, False, pid), 1
+                )
+            else:
+                os.kill(pid, signal.SIGTERM)
+            click.echo(f"  Signalled pid {pid}")
+        except ProcessLookupError:
+            click.echo(f"  pid {pid}: already stopped")
+        except PermissionError:
+            click.echo(f"  pid {pid}: permission denied — skipping")
+
+    # ── Wait for processes to exit ────────────────────────────────────────
+    click.echo(f"Waiting up to {timeout}s for workers to finish current jobs...")
+    deadline = time.monotonic() + timeout
+    remaining = list(pids)
+
+    while remaining and time.monotonic() < deadline:
+        time.sleep(0.5)
+        still_alive = []
+        for pid in remaining:
+            try:
+                os.kill(pid, 0)          # signal 0 = existence check, no-op
+                still_alive.append(pid)
+            except (ProcessLookupError, PermissionError):
+                click.echo(f"  pid {pid}: stopped cleanly")
+        remaining = still_alive
+
+    # ── Force-kill any that didn't stop in time ───────────────────────────
+    if remaining:
+        click.echo(
+            f"  {len(remaining)} worker(s) did not stop within {timeout}s "
+            f"— force-killing: {remaining}"
+        )
+        for pid in remaining:
+            try:
+                if sys.platform == "win32":
+                    import ctypes
+                    ctypes.windll.kernel32.TerminateProcess(
+                        ctypes.windll.kernel32.OpenProcess(1, False, pid), 1
+                    )
+                else:
+                    os.kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+
+    _remove_pid_file()
+    click.echo("All workers stopped.")
+    logger.info("worker stop complete | pids=%s", pids)
 
 
 # ---------------------------------------------------------------------------
