@@ -33,7 +33,7 @@ QueueCTL is a minimal, correct implementation of what Sidekiq, Celery, or AWS SQ
 | **Atomic claim** | `UPDATE … WHERE id = (SELECT … LIMIT 1) RETURNING *` — SQLite serialises writes so two workers can never claim the same job |
 | **Exponential backoff** | `delay = backoff_base ^ attempts`, capped at 300 s — configurable |
 | **Dead Letter Queue** | Jobs that exhaust retries move to `dead` state; operator can revive with `dlq retry` |
-| **Crash recovery** | On startup, workers reset any orphaned `processing` jobs back to `pending` |
+| **Crash recovery** | On startup, workers reset orphaned `processing` jobs to `pending`; jobs owned by live sibling workers are skipped — no false resets in multi-worker deployments |
 | **Graceful shutdown** | `SIGINT` / `Ctrl-C` finishes the current job before exiting — no mid-execution kills |
 | **Job timeout** | Subprocess killed after `timeout_seconds`; counts as a failure attempt |
 | **Configurable** | `max_retries`, `backoff_base`, `timeout_seconds`, `poll_interval_ms` stored in the DB |
@@ -466,7 +466,7 @@ config.py           →  storage/*
 
 `core/` never imports from `cli.py`. `storage/` never imports from `core/`.
 Every module in `core/` and `storage/` is fully testable without a click
-invocation — this is what makes the 163 unit tests fast and deterministic.
+invocation — this is what makes the 168 unit tests fast and deterministic.
 
 ---
 
@@ -495,13 +495,18 @@ next steps:
 queuectl/
 ├── cli.py                  Entrypoint — all click commands
 ├── config.py               Config table CRUD and CLI↔DB key normalisation
+├── seed_jobs.py            Demo seeder — enqueues sample jobs via the service layer
+│                           (bypasses shell quoting; useful for quick manual testing)
+├── simulate_crash.py       Injects an orphaned 'processing' job to demonstrate
+│                           crash recovery without needing to kill a real worker
 ├── ARCHITECTURE.md         Full architecture diagrams and design log
 ├── core/
 │   ├── exceptions.py       Domain exceptions (never expose raw sqlite3 errors)
 │   ├── job.py              Job dataclass + state machine constants
 │   ├── job_service.py      enqueue, claim_job (atomic), mark_complete, mark_failed
 │   ├── retry.py            calculate_backoff, schedule_retry, move_to_dlq, dlq_retry
-│   └── worker.py           Subprocess execution loop, crash recovery, SIGINT handler
+│   └── worker.py           Subprocess execution loop, sibling-aware crash recovery,
+│                           SIGINT handler
 ├── storage/
 │   ├── db.py               Connection factory (WAL, row_factory, busy_timeout=5000)
 │   └── queries.py          All SQL — single source of truth for every query

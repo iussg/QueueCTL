@@ -185,10 +185,11 @@ sequenceDiagram
     participant DB as SQLite
 
     W->>DB: SELECT * FROM jobs WHERE state='processing'
-    DB-->>W: [job-5, job-9] — orphaned from crashed worker
-    W->>DB: UPDATE jobs SET state='pending', worker_id=NULL<br/>WHERE state='processing'
-    DB-->>W: 2 rows reset
-    W->>W: Log WARNING "Crash recovery: reset 2 orphaned jobs"
+    DB-->>W: [job-5, job-9] — some may be owned by live siblings
+    Note over W: Filter by skip_pids: exclude jobs whose<br/>worker_id PID is still running
+    W->>DB: UPDATE jobs SET state='pending', worker_id=NULL<br/>WHERE id IN ('job-5') AND state='processing'
+    DB-->>W: 1 row reset (job-9 skipped — sibling alive)
+    W->>W: Log WARNING "Crash recovery: reset 1 orphaned job(s)"
     W->>W: Enter poll loop
 ```
 
@@ -239,6 +240,15 @@ queuectl/
 │                             (max-retries) to DB underscore keys (max_retries).
 │                             Typed getters: get_int_config, get_float_config.
 │
+├── seed_jobs.py            ← Demo seeder. Calls the service layer directly to
+│                             enqueue sample jobs — bypasses shell quoting issues
+│                             on Windows PowerShell. Mirrors the CLI's own code path.
+│
+├── simulate_crash.py       ← Injects a fake orphaned 'processing' job into the DB
+│                             to reproduce a crashed-worker scenario without killing
+│                             a real process. Pair with 'worker start' to observe
+│                             crash recovery in action.
+│
 ├── core/
 │   ├── job.py              ← Job dataclass + state machine constants.
 │   │                         JobState, VALID_TRANSITIONS, OUTPUT_TRUNCATION_LIMIT.
@@ -263,6 +273,8 @@ queuectl/
 │   └── worker.py           ← Subprocess execution loop.
 │                             Worker class: run(), _recover_orphaned_jobs(),
 │                             _execute_job(). SIGINT/SIGTERM → clean shutdown.
+│                             _recover_orphaned_jobs() accepts skip_pids to avoid
+│                             resetting jobs owned by live sibling workers.
 │                             _worker_process_main() — multiprocessing entry point.
 │
 ├── storage/
@@ -281,7 +293,7 @@ queuectl/
     ├── test_job_service.py ← Phase 2: 58 tests (service layer, atomic claim).
     ├── test_retry.py       ← Phase 3: 53 tests (backoff, DLQ, config).
     ├── test_worker.py      ← Phase 4: 31 tests (execution, crash recovery).
-    └── test_concurrency.py ← Phase 5: multiprocessing stress test (planned).
+    └── test_concurrency.py ← Phase 5:  5 multiprocessing stress tests.
 ```
 
 ---
@@ -369,9 +381,9 @@ CREATE TABLE config (
 | 1 | `test_schema.py` | 21 | Schema integrity, WAL mode, idempotent init |
 | 2 | `test_job_service.py` | 58 | Service layer, atomic claim single-process, FIFO, truncation |
 | 3 | `test_retry.py` | 53 | Backoff formula, DLQ movement, config CRUD |
-| 4 | `test_worker.py` | 31 | Subprocess execution, crash recovery, timeout |
-| 5 | `test_concurrency.py` | TBD | No double-claim under real multiprocessing contention |
-| **Total** | | **163+** | |
+| 4 | `test_worker.py` | 31 | Subprocess execution, crash recovery, sibling-aware orphan filtering, timeout |
+| 5 | `test_concurrency.py` | 5 | No double-claim under real multiprocessing contention |
+| **Total** | | **168** | |
 
 ---
 
