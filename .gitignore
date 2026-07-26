@@ -32,3 +32,6 @@ htmlcov/
 .idea/
 *.swp
 *.swo
+
+# Runtime state
+queuectl_workers.json

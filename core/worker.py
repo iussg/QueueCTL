@@ -127,12 +127,17 @@ class Worker:
     # Crash recovery
     # ------------------------------------------------------------------
 
-    def _recover_orphaned_jobs(self) -> None:
+    def _recover_orphaned_jobs(self, skip_pids: set[int] | None = None) -> None:
         """
         Reset jobs stuck in ``'processing'`` state from a prior crashed run.
 
         Called once at startup, before entering the poll loop.  Idempotent:
         if no orphaned jobs exist, this is a no-op.
+
+        Args:
+            skip_pids: PIDs of sibling workers that are alive and may legitimately
+                       own processing jobs.  Jobs whose ``worker_id`` contains one
+                       of these PIDs are skipped — they are NOT orphans.
         """
         rows = self.conn.execute(queries.SELECT_PROCESSING_JOBS).fetchall()
         if not rows:
@@ -141,10 +146,33 @@ class Worker:
             )
             return
 
-        orphan_ids = [row["id"] for row in rows]
+        # Filter out jobs owned by live sibling workers.
+        if skip_pids:
+            orphan_rows = [
+                row for row in rows
+                if not _worker_id_pid_in(row["worker_id"], skip_pids)
+            ]
+        else:
+            orphan_rows = list(rows)
+
+        if not orphan_rows:
+            logger.info(
+                "Worker %s — crash recovery: no orphaned jobs "
+                "(all %d processing job(s) owned by live siblings)",
+                self.worker_id, len(rows),
+            )
+            return
+
+        orphan_ids = [row["id"] for row in orphan_rows]
         now = _now_utc()
+        # Only reset the actual orphans, not sibling-owned jobs.
+        placeholders = ",".join("?" * len(orphan_ids))
         with self.conn:
-            self.conn.execute(queries.RESET_ORPHANED_JOBS, (now,))
+            self.conn.execute(
+                f"UPDATE jobs SET state='pending', worker_id=NULL, "
+                f"updated_at=? WHERE id IN ({placeholders}) AND state='processing'",
+                [now, *orphan_ids],
+            )
 
         logger.warning(
             "Worker %s — crash recovery: reset %d orphaned job(s) to pending: %s",
