@@ -157,6 +157,36 @@ def _read_pid_file() -> list[int] | None:
         return None
 
 
+def _pid_alive(pid: int) -> bool:
+    """Return True if the process with the given PID is still running.
+
+    Uses the Windows API on win32 because ``os.kill(pid, 0)`` is not
+    supported for existence checks on Windows (raises WinError 87).
+    """
+    if sys.platform == "win32":
+        import ctypes
+        PROCESS_QUERY_INFORMATION = 0x0400
+        STILL_ACTIVE = 259
+        handle = ctypes.windll.kernel32.OpenProcess(
+            PROCESS_QUERY_INFORMATION, False, pid
+        )
+        if not handle:
+            return False
+        exit_code = ctypes.c_ulong(0)
+        got = ctypes.windll.kernel32.GetExitCodeProcess(
+            handle, ctypes.byref(exit_code)
+        )
+        ctypes.windll.kernel32.CloseHandle(handle)
+        return bool(got) and exit_code.value == STILL_ACTIVE
+    else:
+        try:
+            os.kill(pid, 0)   # signal 0 = existence check, no-op if alive
+            return True
+        except (ProcessLookupError, PermissionError):
+            return False
+
+
+
 # ---------------------------------------------------------------------------
 # Root command group
 # ---------------------------------------------------------------------------
@@ -396,10 +426,9 @@ def worker_stop(timeout: int) -> None:
         time.sleep(0.5)
         still_alive = []
         for pid in remaining:
-            try:
-                os.kill(pid, 0)          # signal 0 = existence check, no-op
+            if _pid_alive(pid):
                 still_alive.append(pid)
-            except (ProcessLookupError, PermissionError):
+            else:
                 click.echo(f"  pid {pid}: stopped cleanly")
         remaining = still_alive
 
@@ -432,7 +461,7 @@ def worker_stop(timeout: int) -> None:
 
 @cli.command("status")
 def status() -> None:
-    """Show a summary of job counts by state.
+    """Show a summary of job counts by state and live worker counts.
 
     This command is read-only — it never modifies the database.
     """
@@ -441,13 +470,32 @@ def status() -> None:
     counts = get_job_counts(conn)
     conn.close()
 
+    # ── Live worker count from PID file ───────────────────────────────────
+    pids = _read_pid_file() or []
+    active = 0
+    idle = 0
+    if pids:
+        processing_count = counts.get("processing", 0)
+        alive_count = sum(
+            1 for pid in pids
+            if _pid_alive(pid)
+        )
+        # Workers that have a job in 'processing' are active; the rest are idle.
+        active = min(processing_count, alive_count)
+        idle = max(alive_count - active, 0)
+
     click.echo("")
+    if pids:
+        click.echo(f"  Workers Active : {active}")
+        click.echo(f"  Workers Idle   : {idle}")
+        click.echo("")
     click.echo(f"  Pending        : {counts['pending']}")
     click.echo(f"  Processing     : {counts['processing']}")
     click.echo(f"  Completed      : {counts['completed']}")
     click.echo(f"  Failed         : {counts['failed']}")
     click.echo(f"  Dead (DLQ)     : {counts['dead']}")
     click.echo("")
+
 
 
 # ---------------------------------------------------------------------------

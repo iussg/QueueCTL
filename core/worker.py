@@ -50,6 +50,32 @@ def _now_utc() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _worker_id_pid_in(worker_id: str | None, pids: set[int]) -> bool:
+    """Return True if the PID embedded in *worker_id* is in *pids*.
+
+    Worker IDs are formatted as ``"worker-<pid>"`` (single worker) or
+    ``"worker-<parent_pid>-<index>"`` (multi-worker pool).  We extract
+    every numeric token from the string and check whether any of them
+    matches a live sibling PID.
+
+    Examples::
+
+        _worker_id_pid_in("worker-12345",   {12345})  → True
+        _worker_id_pid_in("worker-9999-0",  {9999})   → True
+        _worker_id_pid_in("worker-99999",   {12345})  → False  (crashed worker)
+        _worker_id_pid_in(None,             {12345})  → False
+    """
+    if not worker_id:
+        return False
+    # Extract all digit runs from the worker_id string and test each one.
+    import re
+    for token in re.findall(r"\d+", worker_id):
+        if int(token) in pids:
+            return True
+    return False
+
+
+
 # ---------------------------------------------------------------------------
 # Worker class
 # ---------------------------------------------------------------------------

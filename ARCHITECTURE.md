@@ -1,6 +1,7 @@
 # QueueCTL — Architecture & Workflow Reference
 
-> Current as of **Phase 4 (complete)**. Updated after each phase.
+> Current as of **Phase 5 (complete) — all phases done**.
+> 168 tests passing · sibling-aware crash recovery · multi-worker support · full DLQ lifecycle.
 
 ---
 
