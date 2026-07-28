@@ -4,7 +4,7 @@ A durable, CLI-driven background job queue backed by **SQLite** and **Python mul
 
 QueueCTL is a minimal, correct implementation of what Sidekiq, Celery, or AWS SQS + Lambda do in production: jobs are enqueued, claimed atomically by worker processes, executed as shell commands, retried with exponential backoff on failure, and permanently-failed jobs are quarantined in a Dead Letter Queue rather than silently lost.
 
-🎥 **Watch the Demo:** [YouTube](https://www.youtube.com/watch?v=k4r4CjZUcoQ) | [Google Drive](https://drive.google.com/file/d/1n8LUMjs9JzEKubs5dUBeNN9OM3enRH42/view?usp=sharing)
+🎥 **Watch the Demo:** [YouTube](https://youtu.be/FaIsoUOBMtY) | [Google Drive](https://drive.google.com/file/d/1n8LUMjs9JzEKubs5dUBeNN9OM3enRH42/view?usp=sharing)
 
 ---
 
